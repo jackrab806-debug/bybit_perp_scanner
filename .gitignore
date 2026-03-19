@@ -1,0 +1,13 @@
+.env
+*.pyc
+__pycache__/
+data/
+*.db
+*.pkl
+*.parquet
+.venv/
+venv/
+*.log
+
+.DS_Store
+*.code-workspace
