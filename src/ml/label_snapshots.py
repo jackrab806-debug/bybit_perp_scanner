@@ -18,9 +18,10 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
-# Process max 500 snapshots per cycle, with 0.2s between API calls
-_BATCH_LIMIT = 500
-_API_DELAY = 0.2
+# Process max 5000 snapshots per cycle, 10 parallel API calls
+_BATCH_LIMIT = 5000
+_API_DELAY = 0.05
+_MAX_CONCURRENT = 10
 
 
 class SnapshotLabeler:
@@ -30,8 +31,8 @@ class SnapshotLabeler:
         self.db_path = db_path
         self._running = False
 
-    async def run_loop(self, interval_seconds: int = 3600) -> None:
-        """Label unfilled snapshots every hour."""
+    async def run_loop(self, interval_seconds: int = 1800) -> None:
+        """Label unfilled snapshots every 30 min."""
         self._running = True
         logger.info("SnapshotLabeler started")
 
@@ -69,24 +70,49 @@ class SnapshotLabeler:
         if not rows:
             return 0
 
+        # Group rows by (symbol, timestamp) to deduplicate API calls
+        groups: Dict[tuple, List[sqlite3.Row]] = {}
+        for row in rows:
+            key = (row["symbol"], row["timestamp"])
+            groups.setdefault(key, []).append(row)
+
         labeled = 0
+        sem = asyncio.Semaphore(_MAX_CONCURRENT)
         timeout = aiohttp.ClientTimeout(total=10)
+
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            for row in rows:
-                try:
-                    moves = await self._fetch_price_moves(
-                        session, row["symbol"], row["timestamp"], row["mid_price"]
-                    )
-                    if moves:
-                        self._update_label(row["id"], moves)
-                        labeled += 1
+
+            async def _process_group(
+                key: tuple, group_rows: List[sqlite3.Row]
+            ) -> int:
+                async with sem:
+                    symbol, timestamp_str = key
+                    mid_price = group_rows[0]["mid_price"]
+                    try:
+                        moves = await self._fetch_price_moves(
+                            session, symbol, timestamp_str, mid_price
+                        )
+                        if moves:
+                            self._update_labels_batch(
+                                [r["id"] for r in group_rows], moves
+                            )
+                            return len(group_rows)
+                    except Exception:
+                        logger.debug(
+                            "Label error %s/%s", symbol, timestamp_str,
+                            exc_info=True,
+                        )
                     await asyncio.sleep(_API_DELAY)
-                except Exception:
-                    logger.debug(
-                        "Label error %s/%s",
-                        row["symbol"], row["timestamp"],
-                        exc_info=True,
-                    )
+                    return 0
+
+            tasks = [
+                _process_group(key, group_rows)
+                for key, group_rows in groups.items()
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, int):
+                    labeled += r
 
         return labeled
 
@@ -159,29 +185,32 @@ class SnapshotLabeler:
             "abs_max": abs_max,
         }
 
-    def _update_label(self, snapshot_id: int, moves: Dict[str, Optional[float]]) -> None:
-        """Write label to database (sync)."""
+    def _update_labels_batch(
+        self, snapshot_ids: List[int], moves: Dict[str, Optional[float]]
+    ) -> None:
+        """Write label to database for multiple IDs sharing same moves (sync)."""
+        params = (
+            moves["move_1h"],
+            moves["move_2h"],
+            moves["move_4h"],
+            moves["max_move"],
+            moves["abs_max"],
+        )
         with sqlite3.connect(self.db_path) as con:
-            con.execute(
-                """
-                UPDATE ml_snapshots SET
-                    move_1h_pct = ?,
-                    move_2h_pct = ?,
-                    move_4h_pct = ?,
-                    max_move_4h_pct = ?,
-                    abs_max_move_4h = ?,
-                    label_filled = 1
-                WHERE id = ?
-                """,
-                (
-                    moves["move_1h"],
-                    moves["move_2h"],
-                    moves["move_4h"],
-                    moves["max_move"],
-                    moves["abs_max"],
-                    snapshot_id,
-                ),
-            )
+            for sid in snapshot_ids:
+                con.execute(
+                    """
+                    UPDATE ml_snapshots SET
+                        move_1h_pct = ?,
+                        move_2h_pct = ?,
+                        move_4h_pct = ?,
+                        max_move_4h_pct = ?,
+                        abs_max_move_4h = ?,
+                        label_filled = 1
+                    WHERE id = ?
+                    """,
+                    params + (sid,),
+                )
             con.commit()
 
     def stop(self) -> None:
