@@ -8,7 +8,6 @@ Graceful degradation: returns None if model not loaded.
 from __future__ import annotations
 
 import logging
-import math
 import pickle
 from datetime import datetime, timezone
 from pathlib import Path
@@ -223,27 +222,15 @@ class FragilityPredictor:
             "spread_z": _nan0(ob.get("spread_z")),
             "vol_ratio_5m": 0.0,  # populated at runtime if available
 
-            # Computed interaction features
+            # Computed interaction features (top 5 only)
             "abs_funding": abs(funding_rate),
-            "abs_oi_change_1h": abs(oi_change_1h),
-            "abs_oi_change_4h": abs(oi_change_4h),
-            "funding_thin": abs(funding_rate) * thin_pct,
-            "oi_accel_thin": abs(oi_change_1h) * thin_pct,
-            "bb_oi_interaction": bb_width * abs(oi_change_1h),
+            "pressure_ratio": abs(funding_rate) * oi_usd / (d_ask + 1),
+            "settlement_urgency": 1.0 / (mins_to_set + 10),
             "event_intensity": (
                 has_fs * 1.0 + has_vb * 0.5 + has_ve * 3.0
                 + has_ca * 2.0 + has_oi * 1.5
             ),
             "multi_signal": 1.0 if n_types >= 2 else 0.0,
-            "strong_multi": 1.0 if n_types >= 3 else 0.0,
-            "settlement_urgency": 1.0 / (mins_to_set + 10),
-            "is_settlement_hour": 1.0 if now.hour in (0, 8, 16) else 0.0,
-            "log_oi_usd": math.log1p(max(oi_usd, 0)),
-            "log_depth_ask": math.log1p(max(d_ask, 0)),
-            "log_depth_bid": math.log1p(max(d_bid, 0)),
-            "pressure_ratio": abs(funding_rate) * oi_usd / (d_ask + 1),
-            "oi_depth_ask_ratio": oi_usd / (d_ask + 1),
-            "oi_depth_bid_ratio": oi_usd / (d_bid + 1),
         }
         return feat
 

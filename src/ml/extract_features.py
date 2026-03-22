@@ -1,7 +1,7 @@
 """Extract training data from ml_snapshots for the fragility prediction model.
 
 Each row = one hourly snapshot with pre-computed features.
-Label = 1 if abs_max_move_4h >= 3.0%, else 0.
+Label = 1 if abs_max_move_4h >= 5.0%, else 0.
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ import sqlite3
 from pathlib import Path
 from typing import Tuple
 
-import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -51,20 +50,18 @@ _RAW_FEATURES = [
     "spread_z", "vol_ratio_5m",
 ]
 
-# ── Computed interaction features ─────────────────────────────────────────────
+# ── Computed interaction features (kept lean — only proven strong ones) ────────
 
 _COMPUTED_FEATURES = [
-    "abs_funding", "abs_oi_change_1h", "abs_oi_change_4h",
-    "funding_thin", "oi_accel_thin", "bb_oi_interaction",
-    "event_intensity", "multi_signal", "strong_multi",
-    "settlement_urgency", "is_settlement_hour",
-    "log_oi_usd", "log_depth_ask", "log_depth_bid",
+    "abs_funding",
     "pressure_ratio",
-    "oi_depth_ask_ratio", "oi_depth_bid_ratio",
+    "settlement_urgency",
+    "event_intensity",
+    "multi_signal",
 ]
 
 # Threshold for binary label
-_MOVE_THRESHOLD_PCT = 3.0
+_MOVE_THRESHOLD_PCT = 5.0
 
 
 def extract_training_data(
@@ -136,21 +133,18 @@ def extract_training_data(
 
 
 def _add_computed_features(df: pd.DataFrame) -> None:
-    """Compute interaction and derived features from raw columns."""
+    """Compute the strongest interaction features only."""
 
-    # Absolute values (direction doesn't matter for fragility detection)
     df["abs_funding"] = df["funding_rate"].abs()
-    df["abs_oi_change_1h"] = df["oi_change_1h_pct"].abs()
-    df["abs_oi_change_4h"] = df["oi_change_4h_pct"].abs()
 
-    # Core fragility: funding pressure on thin book
-    df["funding_thin"] = df["funding_rate"].abs() * df["thin_pct"]
+    # Pressure / resistance: funding pressure * OI / book depth
+    df["pressure_ratio"] = (
+        df["funding_rate"].abs() * df["oi_usd"]
+        / (df["depth_ask_usdt"] + 1)
+    )
 
-    # OI buildup on thin book
-    df["oi_accel_thin"] = df["oi_change_1h_pct"].abs() * df["thin_pct"]
-
-    # Compression + OI = coiled spring
-    df["bb_oi_interaction"] = df["bb_width_pct"] * df["oi_change_1h_pct"].abs()
+    # Non-linear settlement proximity (strongest in last 30 min)
+    df["settlement_urgency"] = 1.0 / (df["mins_to_settlement"] + 10)
 
     # Event intensity (weighted by empirical hit rates)
     df["event_intensity"] = (
@@ -161,28 +155,8 @@ def _add_computed_features(df: pd.DataFrame) -> None:
         + df["has_oi"] * 1.5
     )
 
-    # Multi-signal flags
+    # Multi-signal flag
     df["multi_signal"] = (df["num_event_types_2h"] >= 2).astype(int)
-    df["strong_multi"] = (df["num_event_types_2h"] >= 3).astype(int)
-
-    # Settlement proximity (non-linear, strongest in last 30 min)
-    df["settlement_urgency"] = 1.0 / (df["mins_to_settlement"] + 10)
-    df["is_settlement_hour"] = df["hour_utc"].isin([0, 8, 16]).astype(int)
-
-    # Log-transform skewed features
-    df["log_oi_usd"] = np.log1p(df["oi_usd"].clip(lower=0))
-    df["log_depth_ask"] = np.log1p(df["depth_ask_usdt"].clip(lower=0))
-    df["log_depth_bid"] = np.log1p(df["depth_bid_usdt"].clip(lower=0))
-
-    # Pressure / resistance ratio
-    df["pressure_ratio"] = (
-        df["funding_rate"].abs() * df["oi_usd"]
-        / (df["depth_ask_usdt"] + 1)
-    )
-
-    # OI relative to book depth
-    df["oi_depth_ask_ratio"] = df["oi_usd"] / (df["depth_ask_usdt"] + 1)
-    df["oi_depth_bid_ratio"] = df["oi_usd"] / (df["depth_bid_usdt"] + 1)
 
 
 if __name__ == "__main__":

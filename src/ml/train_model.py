@@ -86,7 +86,7 @@ def train_model(db_path: str | Path | None = None) -> Optional[Dict[str, Any]]:
     metrics["cv_auc_std"] = round(cv_std, 4)
     metrics["fold_aucs"] = [round(a, 4) for a in fold_aucs]
     metrics["n_folds"] = len(fold_models)
-    metrics["label_threshold_pct"] = 3.0
+    metrics["label_threshold_pct"] = 5.0
 
     # ── Regression model (move magnitude) ──
     reg_model = None
@@ -237,7 +237,7 @@ def _train_lgb(X_tr, y_tr, X_val, y_val, feature_cols, seed=42):
         params, ds_tr,
         valid_sets=[ds_val],
         num_boost_round=500,
-        callbacks=[lgb.early_stopping(100), lgb.log_evaluation(100)],
+        callbacks=[lgb.early_stopping(50), lgb.log_evaluation(100)],
     )
 
     imp = dict(zip(feature_cols, model.feature_importance(importance_type="gain")))
