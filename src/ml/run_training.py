@@ -54,9 +54,21 @@ def main() -> None:
         print("Training failed — not enough data", file=sys.stderr)
         sys.exit(1)
 
-    print(f"\nAUC: {metrics['auc']:.4f}")
+    if metrics.get("retrain_skipped"):
+        print(f"\nRetrain SKIPPED — new AUC {metrics['auc']:.4f}"
+              f" < existing {metrics.get('existing_auc', 0):.4f}")
+        sys.exit(0)
+
+    print(f"\nFinal AUC: {metrics['auc']:.4f}")
+    if metrics.get("cv_auc_mean"):
+        print(f"CV AUC: {metrics['cv_auc_mean']:.4f} "
+              f"(+/- {metrics.get('cv_auc_std', 0):.4f})")
+        print(f"Fold AUCs: {metrics.get('fold_aucs', [])}")
+    if metrics.get("regression_mae"):
+        print(f"Regression MAE: {metrics['regression_mae']:.4f}%")
     print(f"Best threshold: {metrics['best_threshold']:.4f}")
     print(f"Best F1: {metrics['best_f1']:.4f}")
+    print(f"Label: >= {metrics.get('label_threshold_pct', 5.0):.0f}% move")
 
     print("\nThreshold analysis:")
     print(f"  {'Thresh':<8} {'Prec':>8} {'Recall':>8} {'Alerts':>8} {'TP':>6}")

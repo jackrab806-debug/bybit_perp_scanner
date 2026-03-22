@@ -123,7 +123,8 @@ INSERT OR IGNORE INTO ml_snapshots (
     btc_change_1h, btc_change_4h,
     hour_utc, mins_to_settlement, is_weekend,
     has_fs, has_vb, has_ve, has_ca, has_oi,
-    num_event_types_2h, max_event_score
+    num_event_types_2h, max_event_score,
+    spread_z, vol_ratio_5m
 ) VALUES (
     :timestamp, :symbol, :mid_price,
     :funding_rate, :funding_z,
@@ -137,7 +138,8 @@ INSERT OR IGNORE INTO ml_snapshots (
     :btc_change_1h, :btc_change_4h,
     :hour_utc, :mins_to_settlement, :is_weekend,
     :has_fs, :has_vb, :has_ve, :has_ca, :has_oi,
-    :num_event_types_2h, :max_event_score
+    :num_event_types_2h, :max_event_score,
+    :spread_z, :vol_ratio_5m
 )
 """
 
@@ -151,11 +153,17 @@ class SnapshotCollector:
         self._running = False
 
     def initialize(self) -> None:
-        """Create snapshots table (sync — call before event loop)."""
+        """Create snapshots table and add new columns if needed."""
         with sqlite3.connect(self.db_path) as con:
             con.execute(_CREATE_TABLE)
             for idx_sql in _CREATE_INDEXES:
                 con.execute(idx_sql)
+            # Add columns introduced after initial schema
+            for col, typ in [("spread_z", "REAL"), ("vol_ratio_5m", "REAL")]:
+                try:
+                    con.execute(f"ALTER TABLE ml_snapshots ADD COLUMN {col} {typ}")
+                except sqlite3.OperationalError:
+                    pass  # column already exists
             con.commit()
         logger.info("SnapshotCollector: ml_snapshots table ready")
 
@@ -307,6 +315,23 @@ class SnapshotCollector:
             (s * 60 - cur_mins) % 1440 for s in (0, 8, 16, 24)
         )
         row["is_weekend"] = 1 if now.weekday() >= 5 else 0
+
+        # spread_z — from spread_z_history if available
+        spread_z_val = None
+        if hasattr(state, "spread_z_history") and state.spread_z_history:
+            spread_z_val = state.spread_z_history[-1] if state.spread_z_history else None
+        row["spread_z"] = _safe(spread_z_val)
+
+        # vol_ratio_5m — compute from rt_vol_1s deque
+        vol_ratio = None
+        if hasattr(state, "rt_vol_1s") and len(state.rt_vol_1s) > 300:
+            recent = list(state.rt_vol_1s)
+            recent_sum = sum(recent[-300:])  # last 5 min
+            baseline_count = len(recent) - 300
+            if baseline_count > 0:
+                baseline_sum = sum(recent[:-300]) / (baseline_count / 300)
+                vol_ratio = recent_sum / baseline_sum if baseline_sum > 0 else 1.0
+        row["vol_ratio_5m"] = _safe(vol_ratio)
 
         # Events
         event_types: set = set()

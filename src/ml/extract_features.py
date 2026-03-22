@@ -1,7 +1,7 @@
 """Extract training data from ml_snapshots for the fragility prediction model.
 
 Each row = one hourly snapshot with pre-computed features.
-Label = 1 if abs_max_move_4h >= 5.0%, else 0.
+Label = 1 if abs_max_move_4h >= 3.0%, else 0.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import sqlite3
 from pathlib import Path
 from typing import Tuple
 
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -18,22 +19,52 @@ logger = logging.getLogger(__name__)
 _ROOT = Path(__file__).resolve().parent.parent.parent
 _DEFAULT_DB = _ROOT / "data" / "events.db"
 
-# Feature columns stored in ml_snapshots (all known at snapshot time)
-_FEATURE_COLS = [
+# ── Raw columns stored in ml_snapshots ────────────────────────────────────────
+
+_RAW_FEATURES = [
+    # Funding
     "funding_rate", "funding_z",
+    # OI
     "oi_change_1h_pct", "oi_change_4h_pct", "oi_z_24h",
+    # Orderbook
     "thin_pct", "depth_bid_usdt", "depth_ask_usdt",
     "vacuum_dist_bid", "vacuum_dist_ask",
-    "spread_z", "imbalance", "bb_width_pct",
-    "vol_ratio_5m", "oi_to_depth_ratio", "funding_x_oi",
+    "spread_bps", "imbalance", "convexity",
+    # Volatility
+    "bb_width_pct", "rv_pct",
+    # Flow
+    "cvd_ratio_24h", "taker_proxy", "price_accel",
+    # Composite scores
+    "compression", "sps", "lfi", "rank",
+    # Pre-computed derived
+    "oi_to_depth_ratio", "funding_x_oi", "vacuum_asymmetry",
+    # BTC context
     "btc_change_1h", "btc_change_4h",
+    # Time
     "hour_utc", "mins_to_settlement", "is_weekend",
+    # Events
     "has_fs", "has_vb", "has_ve", "has_ca", "has_oi",
     "num_event_types_2h", "max_event_score",
+    # Raw OI value (for log transform)
+    "oi_usd",
+    # New columns (NULL for old rows, populated going forward)
+    "spread_z", "vol_ratio_5m",
 ]
 
-# Threshold for binary label (abs max move in 4h window)
-_MOVE_THRESHOLD_PCT = 5.0
+# ── Computed interaction features ─────────────────────────────────────────────
+
+_COMPUTED_FEATURES = [
+    "abs_funding", "abs_oi_change_1h", "abs_oi_change_4h",
+    "funding_thin", "oi_accel_thin", "bb_oi_interaction",
+    "event_intensity", "multi_signal", "strong_multi",
+    "settlement_urgency", "is_settlement_hour",
+    "log_oi_usd", "log_depth_ask", "log_depth_bid",
+    "pressure_ratio",
+    "oi_depth_ask_ratio", "oi_depth_bid_ratio",
+]
+
+# Threshold for binary label
+_MOVE_THRESHOLD_PCT = 3.0
 
 
 def extract_training_data(
@@ -42,7 +73,6 @@ def extract_training_data(
     """Return (dataframe, feature_col_names) ready for model training."""
 
     conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
 
     df = pd.read_sql_query(
         """
@@ -63,21 +93,29 @@ def extract_training_data(
     logger.info("Loaded %d labeled snapshots", len(df))
 
     # ── Label ──
-    df["label"] = (df["abs_max_move_4h"].abs() >= _MOVE_THRESHOLD_PCT).astype(int)
+    df["abs_max_move"] = df["abs_max_move_4h"].abs().fillna(0)
+    df["label"] = (df["abs_max_move"] >= _MOVE_THRESHOLD_PCT).astype(int)
 
-    # ── Validate feature columns exist ──
-    feature_cols = [c for c in _FEATURE_COLS if c in df.columns]
-    missing = set(_FEATURE_COLS) - set(feature_cols)
-    if missing:
-        logger.warning("Missing feature columns: %s", missing)
-
-    # Coerce to numeric
-    for c in feature_cols:
+    # ── Coerce raw columns to numeric ──
+    raw_available = [c for c in _RAW_FEATURES if c in df.columns]
+    for c in raw_available:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # Drop columns that are >80% NaN
+    # Fill NaN in raw features with 0
+    for c in raw_available:
+        df[c] = df[c].fillna(0)
+
+    # ── Computed interaction features ──
+    _add_computed_features(df)
+
+    # ── Assemble feature list ──
+    feature_cols = raw_available + _COMPUTED_FEATURES
+
+    # Drop columns that are >80% NaN (handles spread_z/vol_ratio_5m if still NULL)
     keep = []
     for c in feature_cols:
+        if c not in df.columns:
+            continue
         frac = df[c].notna().mean()
         if frac > 0.20:
             keep.append(c)
@@ -95,6 +133,56 @@ def extract_training_data(
         100 * df["label"].mean(),
     )
     return df, feature_cols
+
+
+def _add_computed_features(df: pd.DataFrame) -> None:
+    """Compute interaction and derived features from raw columns."""
+
+    # Absolute values (direction doesn't matter for fragility detection)
+    df["abs_funding"] = df["funding_rate"].abs()
+    df["abs_oi_change_1h"] = df["oi_change_1h_pct"].abs()
+    df["abs_oi_change_4h"] = df["oi_change_4h_pct"].abs()
+
+    # Core fragility: funding pressure on thin book
+    df["funding_thin"] = df["funding_rate"].abs() * df["thin_pct"]
+
+    # OI buildup on thin book
+    df["oi_accel_thin"] = df["oi_change_1h_pct"].abs() * df["thin_pct"]
+
+    # Compression + OI = coiled spring
+    df["bb_oi_interaction"] = df["bb_width_pct"] * df["oi_change_1h_pct"].abs()
+
+    # Event intensity (weighted by empirical hit rates)
+    df["event_intensity"] = (
+        df["has_fs"] * 1.0
+        + df["has_vb"] * 0.5
+        + df["has_ve"] * 3.0
+        + df["has_ca"] * 2.0
+        + df["has_oi"] * 1.5
+    )
+
+    # Multi-signal flags
+    df["multi_signal"] = (df["num_event_types_2h"] >= 2).astype(int)
+    df["strong_multi"] = (df["num_event_types_2h"] >= 3).astype(int)
+
+    # Settlement proximity (non-linear, strongest in last 30 min)
+    df["settlement_urgency"] = 1.0 / (df["mins_to_settlement"] + 10)
+    df["is_settlement_hour"] = df["hour_utc"].isin([0, 8, 16]).astype(int)
+
+    # Log-transform skewed features
+    df["log_oi_usd"] = np.log1p(df["oi_usd"].clip(lower=0))
+    df["log_depth_ask"] = np.log1p(df["depth_ask_usdt"].clip(lower=0))
+    df["log_depth_bid"] = np.log1p(df["depth_bid_usdt"].clip(lower=0))
+
+    # Pressure / resistance ratio
+    df["pressure_ratio"] = (
+        df["funding_rate"].abs() * df["oi_usd"]
+        / (df["depth_ask_usdt"] + 1)
+    )
+
+    # OI relative to book depth
+    df["oi_depth_ask_ratio"] = df["oi_usd"] / (df["depth_ask_usdt"] + 1)
+    df["oi_depth_bid_ratio"] = df["oi_usd"] / (df["depth_bid_usdt"] + 1)
 
 
 if __name__ == "__main__":
