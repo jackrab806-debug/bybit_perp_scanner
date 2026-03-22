@@ -59,7 +59,36 @@ def train_model(db_path: str | Path | None = None) -> Optional[Dict[str, Any]]:
     # Evaluate
     metrics = _evaluate(model, X_val, y_val, feature_cols, model_type)
 
-    # Save
+    # ── Guard: never downgrade an existing model ──
+    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    new_auc = metrics["auc"]
+    existing_auc = 0.0
+
+    if MODEL_PATH.exists():
+        try:
+            with open(MODEL_PATH, "rb") as f:
+                old_blob = pickle.load(f)
+            existing_auc = old_blob.get("metrics", {}).get("auc", 0)
+        except Exception:
+            pass
+
+    if new_auc < existing_auc:
+        logger.warning(
+            "Retrain SKIPPED: new AUC %.4f < current AUC %.4f — keeping old model",
+            new_auc, existing_auc,
+        )
+        metrics["retrain_skipped"] = True
+        metrics["existing_auc"] = existing_auc
+        return metrics
+
+    # Backup existing model before overwriting
+    _BACKUP = MODEL_PATH.with_suffix(".backup.pkl")
+    if MODEL_PATH.exists():
+        import shutil
+        shutil.copy2(MODEL_PATH, _BACKUP)
+        logger.info("Backed up existing model → %s", _BACKUP)
+
+    # Save new model
     blob = {
         "model": model,
         "model_type": model_type,
@@ -69,14 +98,14 @@ def train_model(db_path: str | Path | None = None) -> Optional[Dict[str, Any]]:
         "train_samples": int(len(X_tr)),
         "val_samples": int(len(X_val)),
     }
-    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(MODEL_PATH, "wb") as f:
         pickle.dump(blob, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     with open(METRICS_PATH, "w") as f:
         json.dump(metrics, f, indent=2)
 
-    logger.info("Model saved → %s  (AUC=%.4f)", MODEL_PATH, metrics["auc"])
+    logger.info("Model saved → %s  (AUC=%.4f, prev=%.4f)",
+                MODEL_PATH, new_auc, existing_auc)
     return metrics
 
 
@@ -114,7 +143,7 @@ def _train_lgb(X_tr, y_tr, X_val, y_val, feature_cols):
         params, ds_tr,
         valid_sets=[ds_val],
         num_boost_round=500,
-        callbacks=[lgb.early_stopping(50), lgb.log_evaluation(50)],
+        callbacks=[lgb.early_stopping(100), lgb.log_evaluation(50)],
     )
 
     imp = dict(zip(feature_cols, model.feature_importance(importance_type="gain")))

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
@@ -19,6 +20,15 @@ from .predictor import FragilityPredictor
 
 logger = logging.getLogger(__name__)
 
+_SHORT = {
+    "FUNDING_SQUEEZE_SETUP": "FS",
+    "VACUUM_BREAK": "VB",
+    "VOLUME_EXPLOSION": "VE",
+    "CASCADE_ACTIVE": "CA",
+    "OI_SURGE": "OI",
+    "COMPRESSION_SQUEEZE_SETUP": "CS",
+}
+
 
 class ConvictionDigest:
     """Score all coins with ML model and send top-N as Telegram digest."""
@@ -29,6 +39,7 @@ class ConvictionDigest:
         alert_manager: "AlertManager",
         states_fn: Callable[[], Dict[str, "SymbolState"]],
         recent_events_fn: Optional[Callable[[str], List[Dict[str, Any]]]] = None,
+        btc_price_fn: Optional[Callable[[], Optional[tuple]]] = None,
         interval_s: int = 7200,  # 2 hours
         top_n: int = 5,
         min_prob: float = 0.60,
@@ -37,6 +48,7 @@ class ConvictionDigest:
         self.alert_manager = alert_manager
         self._states_fn = states_fn
         self._recent_events_fn = recent_events_fn
+        self._btc_price_fn = btc_price_fn
         self.interval_s = interval_s
         self.top_n = top_n
         self.min_prob = min_prob
@@ -60,7 +72,7 @@ class ConvictionDigest:
                     await self.alert_manager._dispatch_telegram(msg)
                     logger.info("Conviction digest sent")
             except Exception as exc:
-                logger.error("Conviction digest error: %s", exc)
+                logger.error("Conviction digest error: %r", exc)
 
     def _build_digest(self) -> Optional[str]:
         if not self.predictor.is_loaded:
@@ -71,12 +83,12 @@ class ConvictionDigest:
             return None
 
         # Score all symbols
-        scored: List[tuple] = []  # (prob, symbol, state, features)
+        scored: List[tuple] = []  # (prob, symbol, state, features, events)
         for sym, state in states.items():
             if state.rank is None or state.rank < 10:
-                continue  # skip very inactive coins
+                continue
 
-            recent = []
+            recent: List[Dict[str, Any]] = []
             if self._recent_events_fn:
                 try:
                     recent = self._recent_events_fn(sym)
@@ -86,57 +98,77 @@ class ConvictionDigest:
             features = self.predictor.build_features_from_state(state, recent)
             prob = self.predictor.predict(features)
             if prob is not None and prob >= self.min_prob:
-                scored.append((prob, sym, state, features))
+                scored.append((prob, sym, state, features, recent))
 
         if not scored:
             return None
 
-        # Sort by probability descending
         scored.sort(key=lambda x: -x[0])
-        top = scored[:self.top_n]
+        top = scored[: self.top_n]
 
-        # Format message
         now = datetime.now(timezone.utc)
-        thr = self.predictor.threshold
+
+        # BTC regime header
+        btc_str = ""
+        if self._btc_price_fn:
+            try:
+                result = self._btc_price_fn()
+                if result:
+                    pct, price = result
+                    arrow = "\U0001f7e2" if pct >= 0 else "\U0001f534"
+                    btc_str = f" | BTC: {pct:+.1f}% {arrow}"
+            except Exception:
+                pass
 
         lines = [
-            f"<b>\U0001f52e ML CONVICTION ({now:%H:%M} UTC)</b>",
-            f"Model: AUC={self.predictor.metrics.get('auc', 0):.3f} | thr={thr:.2f}",
+            f"\U0001f3af <b>HIGH CONVICTION</b> | {now:%H:%M} UTC{btc_str}",
             "",
         ]
 
-        for i, (prob, sym, state, feats) in enumerate(top, 1):
-            # Conviction level
-            if prob >= thr * 1.5:
-                badge = "\U0001f534"  # red = high conviction
-            elif prob >= thr:
-                badge = "\U0001f7e0"  # orange = above threshold
-            else:
-                badge = "\u26aa"     # white = watch
-
-            # Direction from funding
+        for i, (prob, sym, state, feats, evts) in enumerate(top, 1):
             fund_z = feats.get("funding_z", 0)
             direction = "DN" if fund_z > 0 else "UP"
+            dir_dot = "\U0001f7e2" if direction == "UP" else "\U0001f534"
 
-            # Key signal summary
-            signals = []
-            if feats.get("num_event_types_2h", 0) >= 2:
-                signals.append(f"{int(feats['num_event_types_2h'])}types")
-            if feats.get("thin_pct", 0) > 0.85:
-                signals.append("thin")
-            if abs(fund_z) > 2.0:
-                signals.append(f"fz={fund_z:+.1f}")
-            if feats.get("compression", 0) > 70:
-                signals.append(f"cs={feats['compression']:.0f}")
+            # Event types
+            etypes = list({_SHORT.get(e.get("event_type", ""), e.get("event_type", ""))
+                          for e in evts})
+            n_types = len(etypes) if etypes else 0
+            evt_str = "+".join(sorted(etypes)) if etypes else "-"
+            type_str = f" ({n_types} types)" if n_types >= 2 else ""
 
-            sig_str = " | ".join(signals) if signals else "-"
-
+            # Line 1: symbol, direction, probability, events
             lines.append(
-                f"{badge} {i}. <b>{sym}</b> {direction} "
-                f"P={prob:.1%} | rank={state.rank:.0f} | {sig_str}"
+                f"{i}. <b>{sym}</b> {dir_dot} {direction}"
+                f" | {prob:.0%} | {evt_str}{type_str}"
             )
 
-        total_above = sum(1 for p, *_ in scored if p >= thr)
-        lines.append(f"\n{len(scored)} coins scored | {total_above} above threshold")
+            # Line 2: key data
+            ff = getattr(state, "funding_feats", None) or {}
+            oi = getattr(state, "oi_feats", None) or {}
+            ob = getattr(state, "ob_feats", None) or {}
+
+            fr = ff.get("funding_current", 0) or 0
+            fr_pct = fr * 100
+
+            oi_1h = oi.get("oi_delta_pct_1h", 0) or 0
+
+            thin = ob.get("thin_pct", 0) or 0
+            if thin > 0.95:
+                book_str = "EMPTY"
+            elif thin > 0.85:
+                book_str = f"Thin: {thin:.2f}"
+            else:
+                book_str = "ok"
+
+            lines.append(
+                f"   FR: {fr_pct:+.2f}%"
+                f" | OI: {oi_1h:+.0f}% 1h"
+                f" | Book: {book_str}"
+            )
+
+        total_above = sum(1 for p, *_ in scored if p >= self.predictor.threshold)
+        lines.append(f"\n{len(scored)} coins \u2265 {self.min_prob:.0%}"
+                     f" | {total_above} above threshold")
 
         return "\n".join(lines)

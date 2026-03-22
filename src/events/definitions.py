@@ -1172,22 +1172,32 @@ class AlertManager:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
         url = f"https://api.telegram.org/bot{self._tg_token}/sendMessage"
-        try:
-            timeout = aiohttp.ClientTimeout(total=self._webhook_timeout)
-            async with self._session.post(
-                url,
-                json={
-                    "chat_id": self._tg_chat_id,
-                    "text": text,
-                    "parse_mode": parse_mode,
-                },
-                timeout=timeout,
-            ) as resp:
-                if resp.status >= 400:
+        timeout = aiohttp.ClientTimeout(total=30)
+        payload = {
+            "chat_id": self._tg_chat_id,
+            "text": text,
+            "parse_mode": parse_mode,
+        }
+
+        for attempt in range(2):
+            try:
+                async with self._session.post(
+                    url, json=payload, timeout=timeout,
+                ) as resp:
+                    if resp.status < 400:
+                        return  # success
                     body = await resp.text()
-                    logger.warning("Telegram HTTP %d: %s", resp.status, body[:200])
-        except Exception as exc:
-            logger.warning("Telegram dispatch failed: %s", exc)
+                    logger.warning(
+                        "Telegram HTTP %d (attempt %d): %s",
+                        resp.status, attempt + 1, body[:300],
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Telegram dispatch failed (attempt %d): %r",
+                    attempt + 1, exc,
+                )
+            if attempt == 0:
+                await asyncio.sleep(3)
 
     def _format_event_telegram(self, event: Event) -> str:
         """Format an Event as a Telegram message."""

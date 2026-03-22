@@ -155,6 +155,7 @@ class DataCollector(PressureScanner):
         alert_manager:    Optional[AlertManager]  = None,
         flush_interval:   int  = _FLUSH_INTERVAL,
         ob_depth:         int  = 50,
+        paper_trader:     Any  = None,
     ) -> None:
         super().__init__(
             symbols_by_tier,
@@ -166,6 +167,7 @@ class DataCollector(PressureScanner):
         self._output_dir    = Path(output_dir)
         self._flush_interval = flush_interval
         self._ob_depth      = ob_depth
+        self._paper_trader  = paper_trader
 
         all_syms = list(self._states.keys())
 
@@ -629,6 +631,21 @@ class DataCollector(PressureScanner):
         except Exception as _exc:
             logger.warning("ML snapshot collection unavailable: %s", _exc)
 
+        # ── Paper trader ──────────────────────────────────────────────────────
+        _paper_tasks: list = []
+        if self._paper_trader is not None:
+            try:
+                self._paper_trader.initialize()
+                _paper_tasks = [
+                    asyncio.create_task(
+                        self._paper_trader.run_loop(interval_seconds=60),
+                        name="paper-trader",
+                    ),
+                ]
+                logger.info("PaperTrader task started (60s loop)")
+            except Exception as _exc:
+                logger.warning("PaperTrader unavailable: %s", _exc)
+
         tasks = [
             asyncio.create_task(self._ws.run(),         name="ws"),
             asyncio.create_task(self._poll_oi(),        name="oi-poll"),
@@ -641,6 +658,7 @@ class DataCollector(PressureScanner):
             asyncio.create_task(self._universe_refresh_loop(), name="universe-refresh"),
             *_learning_tasks,
             *_ml_tasks,
+            *_paper_tasks,
         ]
 
         logger.info(
@@ -786,6 +804,30 @@ async def _async_main(args: argparse.Namespace) -> None:
         logger.info("Event detection enabled (SQLite: %s)", _ROOT / "data" / "events.db")
         alert_manager.start_digest_loop()
 
+    # ── ML Predictor (shared by ConvictionDigest + PaperTrader) ──────────────
+    predictor = None
+    try:
+        from src.ml.predictor import FragilityPredictor
+        predictor = FragilityPredictor()
+        if not predictor.load_model():
+            logger.info("No ML model found — predictor disabled")
+            predictor = None
+    except Exception as _exc:
+        logger.warning("ML predictor init failed: %s", _exc)
+
+    # ── Paper Trader ──────────────────────────────────────────────────────────
+    _paper_trader = None
+    try:
+        from src.trading.paper_trader import PaperTrader
+        _paper_trader = PaperTrader(
+            scanner=None,  # wired below after collector is created
+            predictor=predictor,
+            alert_manager=alert_manager,
+            db_path=str(_ROOT / "data" / "events.db"),
+        )
+    except Exception as _exc:
+        logger.warning("PaperTrader init failed: %s", _exc)
+
     # ── Collector ─────────────────────────────────────────────────────────────
     collector = DataCollector(
         symbols_by_tier=symbols_by_tier,
@@ -794,7 +836,12 @@ async def _async_main(args: argparse.Namespace) -> None:
         event_detector=event_detector,
         alert_manager=alert_manager,
         flush_interval=args.flush_interval,
+        paper_trader=_paper_trader,
     )
+
+    # Wire scanner reference into paper trader (now that collector exists)
+    if _paper_trader is not None:
+        _paper_trader.scanner = collector
 
     # Wire BTC regime into digest
     if alert_manager is not None:
@@ -816,38 +863,34 @@ async def _async_main(args: argparse.Namespace) -> None:
 
     # ── ML Conviction Digest ─────────────────────────────────────────────────
     conviction_digest = None
-    if alert_manager is not None:
+    if alert_manager is not None and predictor is not None:
         try:
-            from src.ml.predictor import FragilityPredictor
             from src.ml.conviction_digest import ConvictionDigest
 
-            predictor = FragilityPredictor()
-            if predictor.load_model():
-                def _get_recent_events(sym: str):
-                    """Get recent events for a symbol as dicts."""
-                    return [
-                        {
-                            "event_type": ev.event_type.value,
-                            "score": ev.score,
-                            "direction": ev.direction,
-                        }
-                        for ev in alert_manager._event_history
-                        if ev.symbol == sym
-                    ]
+            def _get_recent_events(sym: str):
+                """Get recent events for a symbol as dicts."""
+                return [
+                    {
+                        "event_type": ev.event_type.value,
+                        "score": ev.score,
+                        "direction": ev.direction,
+                    }
+                    for ev in alert_manager._event_history
+                    if ev.symbol == sym
+                ]
 
-                conviction_digest = ConvictionDigest(
-                    predictor=predictor,
-                    alert_manager=alert_manager,
-                    states_fn=lambda: collector._states,
-                    recent_events_fn=_get_recent_events,
-                )
-                conviction_digest.start()
-                logger.info("ML ConvictionDigest enabled (AUC=%.3f)",
-                            predictor.metrics.get("auc", 0))
-            else:
-                logger.info("No ML model found — conviction digest disabled")
-        except Exception as exc:
-            logger.warning("ML conviction digest init failed: %s", exc)
+            conviction_digest = ConvictionDigest(
+                predictor=predictor,
+                alert_manager=alert_manager,
+                states_fn=lambda: collector._states,
+                recent_events_fn=_get_recent_events,
+                btc_price_fn=_btc_4h_change if alert_manager else None,
+            )
+            conviction_digest.start()
+            logger.info("ML ConvictionDigest enabled (AUC=%.3f)",
+                        predictor.metrics.get("auc", 0))
+        except Exception as _exc:
+            logger.warning("ML conviction digest init failed: %s", _exc)
 
     # Graceful shutdown on SIGTERM (for systemd / Docker)
     loop = asyncio.get_event_loop()
@@ -865,6 +908,8 @@ async def _async_main(args: argparse.Namespace) -> None:
     try:
         await collector.run()
     finally:
+        if _paper_trader is not None:
+            _paper_trader.stop()
         if conviction_digest is not None:
             conviction_digest.stop()
         if alert_manager is not None:
