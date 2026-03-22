@@ -73,7 +73,7 @@ class FragilityPredictor:
     # ── Predict ───────────────────────────────────────────────────────────────
 
     def predict(self, features: Dict[str, float]) -> Optional[float]:
-        """Return P(>3% move in 4h). Ensemble average if fold models exist."""
+        """Return P(>5% move in 4h). Ensemble average if fold models exist."""
         if not self._loaded:
             return None
         try:
@@ -151,7 +151,7 @@ class FragilityPredictor:
 
         now = datetime.now(timezone.utc)
         cur_mins = now.hour * 60 + now.minute
-        mins_to_set = min((s * 60 - cur_mins) % 1440 for s in (0, 480, 960, 1440))
+        mins_to_set = min((s * 60 - cur_mins) % 1440 for s in (0, 8, 16, 24))
 
         evts = recent_events or []
         etypes = {e.get("event_type", "") for e in evts}
@@ -219,8 +219,10 @@ class FragilityPredictor:
             "num_event_types_2h": n_types,
             "max_event_score": max((e.get("score", 0) or 0 for e in evts), default=0),
             "oi_usd": oi_usd,
-            "spread_z": _nan0(ob.get("spread_z")),
-            "vol_ratio_5m": 0.0,  # populated at runtime if available
+            "spread_z": _nan0(
+                state.spread_z_history[-1] if state.spread_z_history else None
+            ),
+            "vol_ratio_5m": _vol_ratio(state),
 
             # Computed interaction features (top 5 only)
             "abs_funding": abs(funding_rate),
@@ -233,6 +235,20 @@ class FragilityPredictor:
             "multi_signal": 1.0 if n_types >= 2 else 0.0,
         }
         return feat
+
+
+def _vol_ratio(state: Any) -> float:
+    """5-min volume vs baseline ratio from rt_vol_1s deque."""
+    rt = getattr(state, "rt_vol_1s", None)
+    if rt is None or len(rt) <= 300:
+        return 0.0
+    recent = list(rt)
+    recent_sum = sum(recent[-300:])
+    baseline_count = len(recent) - 300
+    if baseline_count <= 0:
+        return 0.0
+    baseline_sum = sum(recent[:-300]) / (baseline_count / 300)
+    return recent_sum / baseline_sum if baseline_sum > 0 else 1.0
 
 
 def _nan0(v: Any) -> float:
