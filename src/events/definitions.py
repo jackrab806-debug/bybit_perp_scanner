@@ -1046,6 +1046,9 @@ class AlertManager:
         # VE dedup: max 1 Telegram VE alert per symbol per 30 min
         self._last_ve_alert: Dict[str, datetime] = {}
 
+        # OI_SURGE rate limit: max 3 individual Telegram alerts per 2h
+        self._oi_surge_tg_times: List[float] = []  # monotonic timestamps
+
         # BTC regime: callable returning (pct_4h, price) or None; set by scanner
         self._btc_price_fn: Optional[Any] = None  # Callable[[], Optional[Tuple[float,float]]]
 
@@ -1450,7 +1453,14 @@ class AlertManager:
             elif event.event_type == EventType.VOLUME_EXPLOSION and event.score >= 45:
                 send_individual = True
             elif event.event_type == EventType.OI_SURGE and event.score >= 80:
-                send_individual = True
+                # Max 3 individual OI_SURGE per 2h
+                now_mono = _time_mod.monotonic()
+                self._oi_surge_tg_times = [
+                    t for t in self._oi_surge_tg_times if now_mono - t < 7200
+                ]
+                if len(self._oi_surge_tg_times) < 3:
+                    send_individual = True
+                    self._oi_surge_tg_times.append(now_mono)
 
             if not send_individual:
                 return

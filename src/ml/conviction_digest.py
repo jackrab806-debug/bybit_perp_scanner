@@ -42,7 +42,7 @@ class ConvictionDigest:
         btc_price_fn: Optional[Callable[[], Optional[tuple]]] = None,
         interval_s: int = 7200,  # 2 hours
         top_n: int = 5,
-        min_prob: float = 0.60,
+        min_prob: float = 0.80,
     ) -> None:
         self.predictor = predictor
         self.alert_manager = alert_manager

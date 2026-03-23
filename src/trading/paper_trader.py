@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-import time
+import time as _time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -178,6 +178,7 @@ class PaperTrader:
         self.max_open_trades = 5
         self._running = False
         self._trade_counter = 0
+        self._symbol_cooldown: Dict[str, float] = {}  # symbol -> monotonic ts
 
         # Entry criteria
         self.min_ml_probability = 0.50
@@ -248,6 +249,9 @@ class PaperTrader:
             if symbol in self.open_trades:
                 continue
             if symbol in ("BTCUSDT", "ETHUSDT"):
+                continue
+            # 4h cooldown after stop loss
+            if _time.monotonic() - self._symbol_cooldown.get(symbol, 0) < 14400:
                 continue
 
             state = states.get(symbol)
@@ -480,6 +484,10 @@ class PaperTrader:
 
         self._save_trade(trade)
         del self.open_trades[symbol]
+
+        # 4h cooldown after stop loss
+        if reason == TradeStatus.CLOSED_SL:
+            self._symbol_cooldown[symbol] = _time.monotonic()
 
         _reason_text = {
             "CLOSED_TP": "\U0001f3af Take Profit",
