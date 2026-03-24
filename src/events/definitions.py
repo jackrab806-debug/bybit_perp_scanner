@@ -1316,11 +1316,17 @@ class AlertManager:
             if not digest_events:
                 continue
 
-            # Skip coins that only have FS events (not interesting alone)
-            non_fs = [e for e in digest_events
-                      if e.event_type != EventType.FUNDING_SQUEEZE_SETUP]
-            if not non_fs:
-                continue
+            # Only show coins with 2+ event types, OR strong CA/VE alone
+            unique_evt_types = {e.event_type for e in digest_events}
+            if len(unique_evt_types) < 2:
+                # Allow strong CA or VE alone (high hit rates)
+                has_strong = any(
+                    e.event_type in (EventType.CASCADE_ACTIVE, EventType.VOLUME_EXPLOSION)
+                    and e.score >= 60
+                    for e in digest_events
+                )
+                if not has_strong:
+                    continue
 
             max_score = max(ev.score for ev in digest_events)
             # Direction from highest-scored event
@@ -1442,15 +1448,17 @@ class AlertManager:
         await self._dispatch_webhook(event)
 
         # Telegram individual alerts:
-        #   CA: always
-        #   VE: score >= 45
-        #   OI_SURGE: score >= 80
+        #   CA: thin_pct >= 0.50 (filter noise from non-fragile books)
+        #   VE: score >= 50
+        #   OI_SURGE: score >= 80, max 3 per 2h
         #   Everything else (FS/VB/CS): NEVER individual — digest only
         if self._tg_token and self._tg_chat_id:
             send_individual = False
             if event.event_type == EventType.CASCADE_ACTIVE:
-                send_individual = True
-            elif event.event_type == EventType.VOLUME_EXPLOSION and event.score >= 45:
+                thin = (event.features or {}).get("thin_pct", 0) or 0
+                if thin >= 0.50:
+                    send_individual = True
+            elif event.event_type == EventType.VOLUME_EXPLOSION and event.score >= 50:
                 send_individual = True
             elif event.event_type == EventType.OI_SURGE and event.score >= 80:
                 # Max 3 individual OI_SURGE per 2h
