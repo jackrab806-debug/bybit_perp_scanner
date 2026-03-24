@@ -168,6 +168,8 @@ class DataCollector(PressureScanner):
         self._flush_interval = flush_interval
         self._ob_depth      = ob_depth
         self._paper_trader  = paper_trader
+        self._kline_5m      = None
+        self._smc_scanner   = None
 
         all_syms = list(self._states.keys())
 
@@ -631,6 +633,25 @@ class DataCollector(PressureScanner):
         except Exception as _exc:
             logger.warning("ML snapshot collection unavailable: %s", _exc)
 
+        # ── SMC scanner (5m klines + market structure) ─────────────────────
+        _smc_tasks: list = []
+        if self._smc_scanner is not None:
+            try:
+                self._smc_scanner.initialize()
+                _smc_tasks = [
+                    asyncio.create_task(
+                        self._kline_5m.run_loop(interval_seconds=300),
+                        name="kline-5m",
+                    ),
+                    asyncio.create_task(
+                        self._smc_scanner.run_loop(interval_seconds=60),
+                        name="smc-scanner",
+                    ),
+                ]
+                logger.info("SMC scanner started (5m klines + structure detection)")
+            except Exception as _exc:
+                logger.warning("SMC scanner unavailable: %s", _exc)
+
         # ── Paper trader ──────────────────────────────────────────────────────
         _paper_tasks: list = []
         if self._paper_trader is not None:
@@ -658,6 +679,7 @@ class DataCollector(PressureScanner):
             asyncio.create_task(self._universe_refresh_loop(), name="universe-refresh"),
             *_learning_tasks,
             *_ml_tasks,
+            *_smc_tasks,
             *_paper_tasks,
         ]
 
@@ -842,6 +864,25 @@ async def _async_main(args: argparse.Namespace) -> None:
     # Wire scanner reference into paper trader (now that collector exists)
     if _paper_trader is not None:
         _paper_trader.scanner = collector
+
+    # ── SMC Scanner (5m klines + market structure detection) ───────────────
+    try:
+        from src.features.klines_5m import KlineCollector5m
+        from src.features.smc_scanner import SMCScanner
+
+        _kline_5m = KlineCollector5m()
+        _smc = SMCScanner(
+            kline_collector=_kline_5m,
+            scanner=collector,
+            predictor=predictor,
+            alert_manager=alert_manager,
+            db_path=str(_ROOT / "data" / "events.db"),
+        )
+        collector._kline_5m = _kline_5m
+        collector._smc_scanner = _smc
+        logger.info("SMC scanner wired")
+    except Exception as _exc:
+        logger.warning("SMC scanner init failed: %s", _exc)
 
     # Wire BTC regime into digest
     if alert_manager is not None:
