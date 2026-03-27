@@ -170,6 +170,7 @@ class DataCollector(PressureScanner):
         self._paper_trader  = paper_trader
         self._kline_5m      = None
         self._smc_scanner   = None
+        self._unified_report = None
 
         all_syms = list(self._states.keys())
 
@@ -652,6 +653,17 @@ class DataCollector(PressureScanner):
             except Exception as _exc:
                 logger.warning("SMC scanner unavailable: %s", _exc)
 
+        # ── Unified report ────────────────────────────────────────────────────
+        _report_tasks: list = []
+        if self._unified_report is not None:
+            _report_tasks = [
+                asyncio.create_task(
+                    self._unified_report.run_loop(),
+                    name="unified-report",
+                ),
+            ]
+            logger.info("UnifiedReport task started (every 4h)")
+
         # ── Paper trader ──────────────────────────────────────────────────────
         _paper_tasks: list = []
         if self._paper_trader is not None:
@@ -680,6 +692,7 @@ class DataCollector(PressureScanner):
             *_learning_tasks,
             *_ml_tasks,
             *_smc_tasks,
+            *_report_tasks,
             *_paper_tasks,
         ]
 
@@ -824,7 +837,7 @@ async def _async_main(args: argparse.Namespace) -> None:
             telegram_chat_id=tg_chat_id,
         )
         logger.info("Event detection enabled (SQLite: %s)", _ROOT / "data" / "events.db")
-        alert_manager.start_digest_loop()
+        # Digest loop disabled — UnifiedReport replaces it
 
     # ── ML Predictor (shared by ConvictionDigest + PaperTrader) ──────────────
     predictor = None
@@ -902,36 +915,20 @@ async def _async_main(args: argparse.Namespace) -> None:
             return (pct, close_now)
         alert_manager._btc_price_fn = _btc_4h_change
 
-    # ── ML Conviction Digest ─────────────────────────────────────────────────
-    conviction_digest = None
-    if alert_manager is not None and predictor is not None:
-        try:
-            from src.ml.conviction_digest import ConvictionDigest
-
-            def _get_recent_events(sym: str):
-                """Get recent events for a symbol as dicts."""
-                return [
-                    {
-                        "event_type": ev.event_type.value,
-                        "score": ev.score,
-                        "direction": ev.direction,
-                    }
-                    for ev in alert_manager._event_history
-                    if ev.symbol == sym
-                ]
-
-            conviction_digest = ConvictionDigest(
-                predictor=predictor,
-                alert_manager=alert_manager,
-                states_fn=lambda: collector._states,
-                recent_events_fn=_get_recent_events,
-                btc_price_fn=_btc_4h_change if alert_manager else None,
-            )
-            conviction_digest.start()
-            logger.info("ML ConvictionDigest enabled (AUC=%.3f)",
-                        predictor.metrics.get("auc", 0))
-        except Exception as _exc:
-            logger.warning("ML conviction digest init failed: %s", _exc)
+    # ── Unified Report (replaces ConvictionDigest + individual alerts) ────
+    _unified_report = None
+    try:
+        from src.alerts.unified_report import UnifiedReport
+        _unified_report = UnifiedReport(
+            scanner=collector,
+            predictor=predictor,
+            alert_manager=alert_manager,
+            db_path=str(_ROOT / "data" / "events.db"),
+        )
+        collector._unified_report = _unified_report
+        logger.info("UnifiedReport wired (every 4h, strict filters)")
+    except Exception as _exc:
+        logger.warning("UnifiedReport init failed: %s", _exc)
 
     # Graceful shutdown on SIGTERM (for systemd / Docker)
     loop = asyncio.get_event_loop()
@@ -951,10 +948,8 @@ async def _async_main(args: argparse.Namespace) -> None:
     finally:
         if _paper_trader is not None:
             _paper_trader.stop()
-        if conviction_digest is not None:
-            conviction_digest.stop()
-        if alert_manager is not None:
-            alert_manager.stop_digest_loop()
+        if _unified_report is not None:
+            _unified_report.stop()
         await rest.__aexit__(None, None, None)
 
 

@@ -281,7 +281,7 @@ class EventDetector:
         checkers = [
             (EventType.COMPRESSION_SQUEEZE_SETUP, self._check_compression_squeeze, None),
             (EventType.FUNDING_SQUEEZE_SETUP,     self._check_funding_squeeze,     None),
-            (EventType.VACUUM_BREAK,              self._check_vacuum_break,         None),
+            # VACUUM_BREAK disabled — 0% hit rate on 63 events (pure noise)
             (EventType.CASCADE_ACTIVE,            self._check_cascade_active,       None),
             (EventType.OI_SURGE,                  self._check_oi_surge,             _OIS_COOLDOWN),
         ]
@@ -1398,13 +1398,12 @@ class AlertManager:
     # ── Public API ─────────────────────────────────────────────────────────────
 
     async def handle(self, event: Event) -> None:
-        """Persist event to SQLite+CSV, then dispatch webhook if within global rate limit."""
+        """Persist event to SQLite+CSV. No individual Telegram — UnifiedReport handles that."""
 
-        # Always persist to SQLite + CSV regardless of rate limit
         self._log_sqlite(event)
         self._log_csv(event)
 
-        # Buffer for digest summary
+        # Buffer for UnifiedReport queries
         self._event_history.append(event)
         self._prune_event_history()
 
@@ -1417,95 +1416,7 @@ class AlertManager:
             event.score,
         )
 
-        # Global rate limit: keep at most global_max dispatched webhooks per window.
-        now_m = _time_mod.monotonic()
-        self._global_events = [
-            (ts, ev) for ts, ev in self._global_events
-            if now_m - ts < self._global_window
-        ]
-        if len(self._global_events) >= self._global_max:
-            weakest_idx = min(
-                range(len(self._global_events)),
-                key=lambda i: self._global_events[i][1].score,
-            )
-            weakest_score = self._global_events[weakest_idx][1].score
-            if event.score <= weakest_score:
-                logger.debug(
-                    "Global rate limit (%d/%ds): dropping %s %s score=%.1f "
-                    "(weakest in window=%.1f)",
-                    self._global_max, int(self._global_window),
-                    event.symbol, event.event_type.value, event.score, weakest_score,
-                )
-                return
-            logger.debug(
-                "Global rate limit: upgrading slot %.1f → %s %s score=%.1f",
-                weakest_score, event.symbol, event.event_type.value, event.score,
-            )
-            self._global_events[weakest_idx] = (now_m, event)
-        else:
-            self._global_events.append((now_m, event))
-
         await self._dispatch_webhook(event)
-
-        # Telegram individual alerts:
-        #   CA: thin_pct >= 0.50 (filter noise from non-fragile books)
-        #   VE: score >= 50
-        #   OI_SURGE: score >= 80, max 3 per 2h
-        #   Everything else (FS/VB/CS): NEVER individual — digest only
-        if self._tg_token and self._tg_chat_id:
-            send_individual = False
-            if event.event_type == EventType.CASCADE_ACTIVE:
-                thin = (event.features or {}).get("thin_pct", 0) or 0
-                if thin >= 0.50:
-                    send_individual = True
-            elif event.event_type == EventType.VOLUME_EXPLOSION and event.score >= 50:
-                send_individual = True
-            elif event.event_type == EventType.OI_SURGE and event.score >= 80:
-                # Max 3 individual OI_SURGE per 2h
-                now_mono = _time_mod.monotonic()
-                self._oi_surge_tg_times = [
-                    t for t in self._oi_surge_tg_times if now_mono - t < 7200
-                ]
-                if len(self._oi_surge_tg_times) < 3:
-                    send_individual = True
-                    self._oi_surge_tg_times.append(now_mono)
-
-            if not send_individual:
-                return
-            # VE dedup: max 1 per symbol per 30 min
-            if event.event_type == EventType.VOLUME_EXPLOSION:
-                now_utc = datetime.now(timezone.utc)
-                last_ve = self._last_ve_alert.get(event.symbol)
-                if last_ve and (now_utc - last_ve).total_seconds() < 1800:
-                    logger.debug(
-                        "VE dedup: skipping %s (last alert %.0fs ago)",
-                        event.symbol,
-                        (now_utc - last_ve).total_seconds(),
-                    )
-                    return
-                self._last_ve_alert[event.symbol] = now_utc
-            msg = self._format_event_telegram(event)
-
-            # AI analysis appended for events scoring >= 70
-            if self._analysis_agent is not None:
-                btc_ctx = ""
-                if self._btc_price_fn is not None:
-                    try:
-                        result = self._btc_price_fn()
-                        if result is not None:
-                            btc_ctx = f"{result[0]:+.1f}% (4h)"
-                    except Exception:
-                        pass
-                try:
-                    analysis = await self._analysis_agent.analyze_event(
-                        event, btc_context=btc_ctx
-                    )
-                    if analysis:
-                        msg += f"\n\n\U0001f9e0 {analysis}"
-                except Exception as exc:
-                    logger.debug("Analysis skipped for %s: %r", event.symbol, exc)
-
-            await self._dispatch_telegram(msg)
 
     async def close(self) -> None:
         """Close the underlying aiohttp session."""
