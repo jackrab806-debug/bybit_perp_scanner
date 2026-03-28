@@ -159,38 +159,10 @@ class SMCScanner:
             return []
 
     async def _send_alert(self, setup: SMCSetup, ml_prob: Optional[float]) -> None:
-        dir_emoji = "\U0001f7e2" if setup.direction == "LONG" else "\U0001f534"
-
-        fvg_line = ""
-        if setup.fvg:
-            fvg_line = f"FVG: {setup.fvg.bottom:.6g} \u2014 {setup.fvg.top:.6g}\n"
-
-        ml_line = f"ML: {ml_prob:.0%} | " if ml_prob is not None else ""
-
-        msg = (
-            f"\U0001f3af SMC ENTRY SETUP\n"
-            f"{dir_emoji} {setup.symbol} {setup.direction}\n"
-            f"\n"
-            f"Sweep: {setup.sweep_level:.6g}\n"
-            f"Displacement: {setup.displacement_size_pct:.1f}%\n"
-            f"{fvg_line}"
-            f"\n"
-            f"Entry: {setup.entry_price:.6g}\n"
-            f"Stop: {setup.stop_loss:.6g}\n"
-            f"Target: {setup.take_profit:.6g}\n"
-            f"R:R = 1:{setup.risk_reward:.1f}\n"
-            f"\n"
-            f"{ml_line}Confidence: {setup.confidence:.0f}/100"
-        )
-
-        if self.alert_manager:
-            try:
-                await self.alert_manager._dispatch_telegram(msg, parse_mode="")
-            except Exception:
-                logger.debug("SMC telegram error", exc_info=True)
-
+        """Save to DB only — UnifiedReport handles Telegram."""
+        self._save_setup(setup, ml_prob)
         logger.info(
-            "SMC setup: %s %s entry=%.6g RR=1:%.1f conf=%d",
+            "SMC setup saved: %s %s entry=%.6g RR=1:%.1f conf=%d",
             setup.symbol, setup.direction, setup.entry_price,
             setup.risk_reward, setup.confidence,
         )
